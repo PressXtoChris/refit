@@ -38,6 +38,7 @@ services
 
 * [Where does this work?](#where-does-this-work)
   * [Breaking changes in 6.x](#breaking-changes-in-6x)
+  * [Breaking changes in 11.x](#breaking-changes-in-11x)
 * [API Attributes](#api-attributes)
 * [Querystrings](#querystrings)
   * [Dynamic Querystring Parameters](#dynamic-querystring-parameters)
@@ -111,6 +112,24 @@ Refit 6 makes [System.Text.Json](https://docs.microsoft.com/en-us/dotnet/standar
 Refit 6.3 splits out the XML serialization via `XmlContentSerializer` into a separate package, `Refit.Xml`. This
 is to reduce the dependency size when using Refit with Web Assembly (WASM) applications. If you require XML, add a reference
 to `Refit.Xml`.
+
+### V11.x.x
+
+#### Breaking changes in 11.x
+
+Refit 10 introduces `ApiRequestException` to represent requests that fail before receiving a response from the server.
+This exception will now wrap previous exceptions such as `HttpRequestException` and `TaskCanceledException` when they occur during request execution.
+
+* If you were not wrapping responses with `IApiResponse` and were catching these exceptions directly, you will need to update your code to catch `ApiRequestException` instead.
+* If you were wrapping responses with `IApiResponse`, these exceptions will no longer be thrown and will instead be captured in the `IApiResponse.Error` property.
+You can use the new `IApiResponse.HasRequestError(out var apiRequestException)` method to safely check and retrieve the `ApiRequestException` instance.
+
+The `IApiResponse.Error` property's type has also changed to `ApiExceptionBase`, which is the new base class for `ApiException` and `ApiRequestException`.
+If your code accessed members specific to `ApiException` (i.e. anything related to the response from the server), you can use the new `IApiResponse.HasResponseError(out var apiException)` method to safely check and retrieve the `ApiException` instance.
+
+All response-related properties of `IApiResponse` are now nullable.
+The new `IApiResponse.IsReceived` property can be used to check if a response was received from the server, and will mark those properties as non-null.
+The original `IApiResponse.IsSuccessful` and `IApiResponse.IsSuccessStatusCode` properties can still be used to check if the response was received and is successful.
 
 ### API Attributes
 
@@ -238,6 +257,12 @@ Task<Tweet> PostTweet([Query]TweetParams params);
 ```
 
 Where `TweetParams` is a POCO, and properties will also support `[AliasAs]` attributes.
+
+If you need to keep internal-only properties on your query DTO, mark them with one of the standard ignore attributes and Refit will skip them when building the query string:
+
+- `[IgnoreDataMember]`
+- `[System.Text.Json.Serialization.JsonIgnore]`
+- `[Newtonsoft.Json.JsonIgnore]`
 
 #### Collections as Querystring parameters
 
@@ -507,6 +532,8 @@ var gitHubApi = RestService.For<IGitHubApi>("https://api.github.com",
     });
 ```
 
+When using `System.Text.Json` polymorphism features such as `[JsonDerivedType]` / `[JsonPolymorphic]`, Refit serializes request bodies using the **declared Refit method parameter type** rather than the boxed runtime `object`. This ensures type discriminators configured on the base contract are preserved in outgoing request payloads.
+
 #### XML Content
 
 XML requests and responses are serialized/deserialized using _System.Xml.Serialization.XmlSerializer_.
@@ -705,6 +732,8 @@ Most APIs need some sort of Authentication. The most common is OAuth Bearer auth
 
 1. Add `[Headers("Authorization: Bearer")]` to the interface or methods which need the token.
 2. Set `AuthorizationHeaderValueGetter` in the `RefitSettings` instance. Refit will call your delegate each time it needs to obtain the token, so it's a good idea for your mechanism to cache the token value for some period within the token lifetime.
+
+`AuthorizationHeaderValueGetter` works whether you create clients with `RestService.For<T>("https://...")` or supply your own `HttpClient` via `RestService.For<T>(httpClient, settings)`. If your API methods accept a `CancellationToken`, that token is propagated to the getter delegate.
 
 #### Reducing header boilerplate with DelegatingHandlers (Authorization headers worked example)
 Although we make provisions for adding dynamic headers at runtime directly in Refit,
@@ -908,6 +937,8 @@ If no key is explicitly defined then the name of the parameter becomes the key.
 If a key is defined multiple times the value in `HttpRequestMessage.Properties` will be overwritten.
 The parameter itself can be any `object`. Properties can be accessed inside a `DelegatingHandler` as follows:
 
+> ⚠️ **Important for `IHttpClientFactory` users:** `DelegatingHandler` instances are pooled and can live longer than a single request scope. Avoid reading per-request state from services that may be scoped/cached across handler lifetimes (for example a tenant/customer resolver stored on the handler). For per-request values like `CustomerId`, pass the value through `[Property]` so each request carries its own state.
+
 ```csharp
 class RequestPropertyHandler : DelegatingHandler
 {
@@ -1098,9 +1129,6 @@ Task<ApiResponse<User>> GetUser(string user);
 //Calling the API
 var response = await gitHubApi.GetUser("octocat");
 
-//Getting the status code (returns a value from the System.Net.HttpStatusCode enumeration)
-var httpStatus = response.StatusCode;
-
 //Determining if a success status code was received and there wasn't any other error
 //(for example, during content deserialization)
 if(response.IsSuccessful)
@@ -1108,21 +1136,27 @@ if(response.IsSuccessful)
     //YAY! Do the thing...
 }
 
-//Retrieving a well-known header value (e.g. "Server" header)
-var serverHeaderValue = response.Headers.Server != null ? response.Headers.Server.ToString() : string.Empty;
-
-//Retrieving a custom header value
-var customHeaderValue = string.Join(',', response.Headers.GetValues("A-Custom-Header"));
-
-//Looping through all the headers
-foreach(var header in response.Headers)
+if (response.IsReceived)
 {
-    var headerName = header.Key;
-    var headerValue = string.Join(',', header.Value);
-}
+    //Getting the status code (returns a value from the System.Net.HttpStatusCode enumeration)
+    var httpStatus = response.StatusCode;
 
-//Finally, retrieving the content in the response body as a strongly-typed object
-var user = response.Content;
+    //Retrieving a well-known header value (e.g. "Server" header)
+    var serverHeaderValue = response.Headers.Server != null ? response.Headers.Server.ToString() : string.Empty;
+
+    //Retrieving a custom header value
+    var customHeaderValue = string.Join(',', response.Headers.GetValues("A-Custom-Header"));
+
+    //Looping through all the headers
+    foreach(var header in response.Headers)
+    {
+        var headerName = header.Key;
+        var headerValue = string.Join(',', header.Value);
+    }
+
+    //Finally, retrieving the content in the response body as a strongly-typed object
+    var user = response.Content;
+}
 ```
 
 ### Using generic interfaces
@@ -1325,10 +1359,9 @@ RestService.For<ISomeApi>(new HttpClient()
 });
 ```
 
-However, when supplying a custom `HttpClient` instance the following `RefitSettings` properties will not work:
+However, when supplying a custom `HttpClient` instance, `HttpMessageHandlerFactory` will not be used because you already control the handler pipeline.
 
-* `AuthorizationHeaderValueGetter`
-* `HttpMessageHandlerFactory`
+`AuthorizationHeaderValueGetter` does still work with `RestService.For<T>(httpClient, settings)` when the request includes an `Authorization` header placeholder (for example `[Headers("Authorization: Bearer")]`).
 
 If you still want to be able to configure the `HtttpClient` instance that `Refit` provides while still making use of the above settings, simply expose the `HttpClient` on the API interface:
 
@@ -1355,11 +1388,45 @@ SomeApi = RestService.For<ISomeApi>("https://www.someapi.com/api/", new RefitSet
 SomeApi.Client.Timeout = timeout;
 ```
 
+### Native AoT / trimming guidance
+
+Refit's recommended **source-generator-first** setup for Native AoT and trimmed applications is:
+
+1. Use normal Refit interfaces so the Refit source generator produces the client implementation at build time.
+2. Prefer `RestService.For<T>(...)` over reflection-heavy manual patterns around `Type` where possible.
+3. Supply source-generated `System.Text.Json` metadata for your DTOs.
+
+For the default `SystemTextJsonContentSerializer` on .NET 8+, Refit prefers `JsonTypeInfo` metadata from your configured `JsonSerializerOptions` when it is available. That means Native AoT apps can improve compatibility by supplying source-generated metadata through a `JsonSerializerContext` or `TypeInfoResolver` on the serializer options they pass into `SystemTextJsonContentSerializer`.
+
+```csharp
+[JsonSerializable(typeof(Todo))]
+public partial class TodoJsonContext : JsonSerializerContext
+{
+}
+
+var settings = new RefitSettings(
+    new SystemTextJsonContentSerializer(
+        new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            TypeInfoResolver = TodoJsonContext.Default
+        }
+    )
+);
+
+var api = RestService.For<ITodoApi>("https://api.example.com", settings);
+```
+
+If a generated Refit client cannot be found at runtime, Refit now explicitly points you back to the source generator/build output and recommends generated clients plus source-generated `System.Text.Json` metadata for Native AoT scenarios.
+
+Refit also ships analyzers for newer Roslyn toolchains, including a Roslyn 5.0 build for newer Visual Studio versions.
+
 ### Handling exceptions
 Refit has different exception handling behavior depending on if your Refit interface methods return `Task<T>` or if they return `Task<IApiResponse>`, `Task<IApiResponse<T>>`, or `Task<ApiResponse<T>>`.
 
 #### <a id="when-returning-taskapiresponset"></a>When returning `Task<IApiResponse>`, `Task<IApiResponse<T>>`, or `Task<ApiResponse<T>>`
-Refit traps any `ApiException` raised by the `ExceptionFactory` when processing the response, and any errors that occur when attempting to deserialize the response to `ApiResponse<T>`, and populates the exception into the `Error` property on `ApiResponse<T>` without throwing the exception.
+Refit traps any `HttpRequestException` or `TaskCanceledException` raised by the `HttpClient` in an `ApiRequestException`.
+Refit also traps any `ApiException` raised by the `ExceptionFactory` when processing the response, and any errors that occur when attempting to deserialize the response to `ApiResponse<T>`.
+In both cases, it will populate the exception into the `Error` property on `ApiResponse<T>` without throwing the exception.
 
 You can then decide what to do like so:
 
@@ -1371,7 +1438,14 @@ if(response.IsSuccessful)
 }
 else
 {
-   _logger.LogError(response.Error, response.Error.Content);
+    // If you want to distinguish between request and response errors
+    if (response.HasRequestError(out var requestError))
+        _logger.LogError(requestError, "An error occurred while sending the request.");
+    else if (response.HasResponseError(out var responseError))
+        _logger.LogError(responseError, responseError.Content);
+
+    // Or just log the error directly
+    _logger.LogError(response.Error, "An error occurred while calling the API.");
 }
 ```
 
@@ -1379,7 +1453,8 @@ else
 > The `IsSuccessful` property checks whether the response status code is in the range 200-299 and there wasn't any other error (for example, during content deserialization). If you just want to check the HTTP response status code, you can use the `IsSuccessStatusCode` property.
 
 #### When returning `Task<T>`
-Refit throws any `ApiException` raised by the `ExceptionFactory` when processing the response and any errors that occur when attempting to deserialize the response to `Task<T>`.
+Refit throws any exception raised by the `HttpClient` and wraps it in an `ApiRequestException`.
+It also throws any `ApiException` raised by the `ExceptionFactory` when processing the response and any errors that occur when attempting to deserialize the response to `Task<T>`.
 
 ```csharp
 // ...
@@ -1387,9 +1462,18 @@ try
 {
    var result = await awesomeApi.GetFooAsync("bar");
 }
+catch (ApiRequestException exception)
+{
+    //exception handling for when a response was not received from the server
+}
 catch (ApiException exception)
 {
-   //exception handling
+   //exception handling for when a response was received from the server
+}
+// Or to not distinguish between request/response exceptions
+catch (ApiExceptionBase exception)
+{
+   //exception handling for when an error occurs during the request/response
 }
 // ...
 ```
@@ -1421,7 +1505,7 @@ catch (ApiException exception)
 
 #### Providing a custom `ExceptionFactory`
 
-You can also override default exceptions behavior that are raised by the `ExceptionFactory` when processing the result by providing a custom exception factory in `RefitSettings`. For example, you can suppress all exceptions with the following:
+You can also override default exceptions behavior that are raised by the `ExceptionFactory` when processing the result by providing a custom exception factory in `RefitSettings`. For example, you can suppress all `ApiException`s with the following:
 
 ```csharp
 var nullTask = Task.FromResult<Exception>(null);

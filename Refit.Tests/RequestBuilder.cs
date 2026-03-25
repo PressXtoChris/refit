@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -454,6 +454,12 @@ namespace Refit.Tests
         [AliasAs("listOfObjectsCsv")]
         [Query(CollectionFormat.Csv)]
         public List<object> ObjectCollectionCcv { get; set; }
+
+        [IgnoreDataMember]
+        public string InternalUseOnlyIgnoredByDataMember { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string InternalUseOnlyIgnoredBySystemTextJson { get; set; }
     }
 
     public class RestMethodInfoTests
@@ -568,6 +574,27 @@ namespace Refit.Tests
             var uri = new Uri(new Uri("http://api"), output.RequestUri);
 
             Assert.Equal("/foo?test-query-alias=one&TestAlias2=two", uri.PathAndQuery);
+        }
+
+        [Fact]
+        public void PostWithObjectQueryParameterSkipsIgnoredProperties()
+        {
+            var fixture = new RequestBuilderImplementation<IDummyHttpApi>();
+
+            var factory = fixture.BuildRequestFactoryForMethod(
+                nameof(IDummyHttpApi.PostWithComplexTypeQuery)
+            );
+
+            var param = new ComplexQueryObject
+            {
+                TestAlias1 = "one",
+                InternalUseOnlyIgnoredByDataMember = "nope",
+                InternalUseOnlyIgnoredBySystemTextJson = "nope"
+            };
+
+            var output = factory(new object[] { param });
+
+            Assert.Equal("/foo?test-query-alias=one", output.RequestUri.PathAndQuery);
         }
 
         [Fact]
@@ -1770,6 +1797,15 @@ namespace Refit.Tests
         [Get("/foo/bar?param=first {id} and second {id}")]
         Task<string> FetchSomeStuffWithTheIdInAParameterMultipleTimes(int id);
 
+        [Get("/foo?q=app_metadata.id:\"{id}\"")]
+        Task<string> FetchSomeStuffWithDoubleQuotesInUrl(int id);
+
+        [Get("/foo/bar/({id})")]
+        Task<string> GetWithTrainingParenthesis(int id);
+
+        [Get("/foo/bar/{id}/")]
+        Task<string> GetWithTrailingSlash(int id);
+
         [Post("/foo/bar/{id}")]
         [Headers("Content-Type: literally/anything")]
         Task<string> PostSomeStuffWithHardCodedContentTypeHeader(int id, [Body] string content);
@@ -2114,6 +2150,13 @@ namespace Refit.Tests
         Task<string> GetWithCancellationAndReturn(CancellationToken token = default);
     }
 
+    interface IAuthenticatedCancellableMethods
+    {
+        [Headers("Authorization: Bearer")]
+        [Get("/foo")]
+        Task GetWithAuthorizationAndCancellation(CancellationToken token = default);
+    }
+
     public enum FooWithEnumMember
     {
         A,
@@ -2281,6 +2324,29 @@ namespace Refit.Tests
 
             var output = factory(new object[] { cts.Token });
             Assert.True(output.CancellationToken.IsCancellationRequested);
+        }
+
+        [Fact]
+        public void AuthorizationHeaderValueGetterReceivesMethodCancellationToken()
+        {
+            var observedCancellationToken = CancellationToken.None;
+            var settings = new RefitSettings
+            {
+                AuthorizationHeaderValueGetter = (_, cancellationToken) =>
+                {
+                    observedCancellationToken = cancellationToken;
+                    return Task.FromResult("tokenValue");
+                }
+            };
+
+            var fixture = new RequestBuilderImplementation<IAuthenticatedCancellableMethods>(settings);
+            var factory = fixture.RunRequest("GetWithAuthorizationAndCancellation");
+            var cts = new CancellationTokenSource();
+
+            var output = factory(new object[] { cts.Token });
+
+            Assert.Equal(cts.Token, observedCancellationToken);
+            Assert.Equal("Bearer tokenValue", output.RequestMessage.Headers.Authorization?.ToString());
         }
 
         [Fact]
@@ -2592,6 +2658,37 @@ namespace Refit.Tests
                 "/void/6%2F6/path?a=test%40example.com&b=push%21%3Dpull",
                 uri.PathAndQuery
             );
+        }
+
+        [Fact]
+        public void QueryParamWhichEndsInDoubleQuotesShouldNotBeTruncated()
+        {
+            var fixture = new RequestBuilderImplementation<IDummyHttpApi>();
+            var factory = fixture.BuildRequestFactoryForMethod(
+                "FetchSomeStuffWithDoubleQuotesInUrl"
+            );
+            var output = factory([42]);
+
+            var uri = new Uri(new Uri("http://api"), output.RequestUri!);
+
+            Assert.Equal("/foo?q=app_metadata.id%3A%2242%22", uri.PathAndQuery);
+        }
+
+        [Theory]
+        [InlineData("GetWithTrainingParenthesis", ")", "/foo/bar/(1)")]
+        [InlineData("GetWithTrailingSlash", "/", "/foo/bar/1/")]
+        public void ShouldCaptureLastCharacterWhenRouteEndsWithConstant(string methodToTest, string constantChar, string contains)
+        {
+            var fixture = new RequestBuilderImplementation<IDummyHttpApi>();
+            var factory = fixture.BuildRequestFactoryForMethod(
+                methodToTest
+            );
+            var output = factory(["1"]);
+
+            var uri = new Uri(new Uri("http://api/"), output.RequestUri!);
+
+            Assert.EndsWith(constantChar, uri.PathAndQuery, StringComparison.Ordinal);
+            Assert.Contains(contains, uri.PathAndQuery, StringComparison.Ordinal);
         }
 
         [Fact]

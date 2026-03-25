@@ -1,17 +1,18 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
-    <AssemblyName>InterfaceStubGeneratorV2</AssemblyName>
+    <AssemblyName>InterfaceStubGeneratorV3</AssemblyName>
     <RootNamespace>Refit.Generator</RootNamespace>
     <IsPackable>false</IsPackable>
     <AssemblyOriginatorKeyFile>..\buildtask.snk</AssemblyOriginatorKeyFile>
     <SignAssembly>true</SignAssembly>
     <IsRoslynComponent>true</IsRoslynComponent>
     <Nullable>enable</Nullable>
-    <DefineConstants>$(DefineConstants);ROSLYN_4</DefineConstants>
-    <MsCACSharpVersion>4.1.0</MsCACSharpVersion>
+    <DefineConstants>$(DefineConstants);ROSLYN_4;ROSLYN_5</DefineConstants>
+    <MsCACSharpVersion>5.0.0</MsCACSharpVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
   </PropertyGroup>
 
   <ItemGroup>

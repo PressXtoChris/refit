@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text;
 using System.Web;
@@ -391,9 +392,27 @@ namespace Refit
                     {
                         await rq.Content!.LoadIntoBufferAsync().ConfigureAwait(false);
                     }
-                    resp = await client
-                        .SendAsync(rq, HttpCompletionOption.ResponseHeadersRead, ct)
-                        .ConfigureAwait(false);
+
+                    try
+                    {
+                        resp = await client
+                            .SendAsync(rq, HttpCompletionOption.ResponseHeadersRead, ct)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!restMethod.IsApiResponse)
+                            throw new ApiRequestException(rq, rq.Method, settings, ex);
+
+                        return ApiResponse.Create<T, TBody>(
+                            rq,
+                            resp,
+                            null,
+                            settings,
+                            new ApiRequestException(rq, rq.Method, settings, ex)
+                        );
+                    }
+
                     content = resp.Content ?? new StringContent(string.Empty);
                     Exception? e = null;
                     disposeResponse = restMethod.ShouldDisposeResponse;
@@ -435,6 +454,7 @@ namespace Refit
                         }
 
                         return ApiResponse.Create<T, TBody>(
+                            rq,
                             resp,
                             body,
                             settings,
@@ -457,7 +477,8 @@ namespace Refit
                         {
                             if (settings.DeserializationExceptionFactory != null)
                             {
-                                var customEx = await settings.DeserializationExceptionFactory(resp, ex).ConfigureAwait(false);
+                                var customEx = await settings.DeserializationExceptionFactory(resp, ex)
+                                    .ConfigureAwait(false);
                                 if (customEx != null)
                                     throw customEx;
                                 return default;
@@ -555,6 +576,9 @@ namespace Refit
 
             foreach (var propertyInfo in props)
             {
+                if (ShouldIgnorePropertyInQueryMap(propertyInfo))
+                    continue;
+
                 var obj = propertyInfo.GetValue(@object);
                 if (obj == null)
                     continue;
@@ -682,6 +706,24 @@ namespace Refit
             return kvps;
         }
 
+        static bool ShouldIgnorePropertyInQueryMap(PropertyInfo propertyInfo)
+        {
+            foreach (var attributeData in propertyInfo.GetCustomAttributesData())
+            {
+                var fullName = attributeData.AttributeType.FullName;
+                if (
+                    fullName == "System.Runtime.Serialization.IgnoreDataMemberAttribute"
+                    || fullName == "System.Text.Json.Serialization.JsonIgnoreAttribute"
+                    || fullName == "Newtonsoft.Json.JsonIgnoreAttribute"
+                )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         Func<object[], HttpRequestMessage> BuildRequestFactoryForMethod(
             RestMethodInfoInternal restMethod,
             string basePath,
@@ -690,9 +732,12 @@ namespace Refit
         {
             return paramList =>
             {
+                var cancellationToken = CancellationToken.None;
+
                 // make sure we strip out any cancellation tokens
                 if (paramsContainsCancellationToken)
                 {
+                    cancellationToken = paramList.OfType<CancellationToken>().FirstOrDefault();
                     paramList = paramList
                         .Where(o => o == null || o.GetType() != typeof(CancellationToken))
                         .ToArray();
@@ -808,6 +853,9 @@ namespace Refit
                 }
 
                 AddHeadersToRequest(headersToAdd, ret);
+                AddAuthorizationHeadersFromGetterAsync(ret, cancellationToken)
+                    .GetAwaiter()
+                    .GetResult();
 
                 AddPropertiesToRequest(restMethod, ret, paramList);
 #if NET6_0_OR_GREATER
@@ -975,7 +1023,10 @@ namespace Refit
                     case BodySerializationMethod.Json:
 #pragma warning restore CS0618 // Type or member is obsolete
                     case BodySerializationMethod.Serialized:
-                        var content = serializer.ToHttpContent(param);
+                        var declaredBodyType = restMethod.ParameterInfoArray[
+                            restMethod.BodyParameterInfo.Item3
+                        ].ParameterType;
+                        var content = SerializeBody(serializer, param, declaredBodyType);
                         switch (restMethod.BodyParameterInfo.Item2)
                         {
                             case false:
@@ -1101,6 +1152,20 @@ namespace Refit
             }
         }
 
+        async Task AddAuthorizationHeadersFromGetterAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (settings.AuthorizationHeaderValueGetter == null)
+                return;
+
+            var auth = request.Headers.Authorization;
+            if (auth == null || !string.IsNullOrWhiteSpace(auth.Parameter))
+                return;
+
+            var token = await settings.AuthorizationHeaderValueGetter(request, cancellationToken)
+                .ConfigureAwait(false);
+            request.Headers.Authorization = new AuthenticationHeaderValue(auth.Scheme, token);
+        }
+
         void AddPropertiesToRequest(RestMethodInfoInternal restMethod, HttpRequestMessage ret, object[] paramList)
         {
             // Add RefitSetting.HttpRequestMessageOptions to the HttpRequestMessage
@@ -1157,6 +1222,25 @@ namespace Refit
             ret.VersionPolicy = settings.VersionPolicy;
         }
 #endif
+
+        static readonly MethodInfo SerializeBodyMethod =
+            typeof(RequestBuilderImplementation).GetMethod(
+                nameof(SerializeBodyGeneric),
+                BindingFlags.Static | BindingFlags.NonPublic
+            )!;
+
+        static HttpContent SerializeBody(
+            IHttpContentSerializer serializer,
+            object? body,
+            Type declaredBodyType
+        )
+        {
+            var serializeMethod = SerializeBodyMethod.MakeGenericMethod(declaredBodyType);
+            return (HttpContent)serializeMethod.Invoke(null, [serializer, body])!;
+        }
+
+        static HttpContent SerializeBodyGeneric<T>(IHttpContentSerializer serializer, object? body) =>
+            serializer.ToHttpContent((T)body!);
 
         IEnumerable<KeyValuePair<string, string?>> ParseQueryParameter(
             object? param,
@@ -1225,7 +1309,7 @@ namespace Refit
                             CollectionFormat.Ssv => " ",
                             CollectionFormat.Tsv => "\t",
                             CollectionFormat.Pipes => "|",
-                            _ => "," 
+                            _ => ","
                         };
 
                     // Missing a "default" clause was preventing the collection from serializing at all, as it was hitting "continue" thus causing an off-by-one error
